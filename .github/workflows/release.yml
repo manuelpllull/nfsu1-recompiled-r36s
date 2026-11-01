@@ -1,21 +1,25 @@
 name: Release R36S bundle
 
-# Manual only (Actions > Release R36S bundle > Run workflow). Builds the PortMaster bundle for the R36S
-# (launcher, settings, metadata, docs) and publishes it as a GitHub release, a draft by default.
+# Builds the PortMaster bundle for the R36S (launcher, settings, metadata, docs, and the game binary when the
+# guest objects are available) and publishes it as a GitHub release.
+#   - Push a tag named r36s-v* (git tag r36s-v1.0.0 && git push origin r36s-v1.0.0): one step. The binary is
+#     built when the guest objects can be found, otherwise the bundle is published without it. Published, not draft.
+#   - Or run it by hand (Actions > Release R36S bundle > Run workflow), a draft by default.
 #
 # The game binary (nfsu.aarch64) contains the lifted game code, which is generated from Speed.exe and is
 # not in this repository. As in the NFSU2 repository, it is built here from precompiled guest objects
-# (the *.o of the lifted code) when include_binary is ticked. The objects are looked up in this order:
-#   1. the repository secret GUEST_OBJS_URL (a direct link to a tar.gz of the *.o files), if set;
-#   2. a release of this repository tagged r36s-guest-objs with a .tar.gz asset (mark it as a pre-release).
-# Create the archive on the machine where the game was built:
-#     tar czf guest-objs.tar.gz -C build/r36s-vm/guest .
-#     gh release create r36s-guest-objs guest-objs.tar.gz --prerelease --title "Guest objects (CI input)" --notes "Precompiled guest objects for the CI build"
+# (the *.o of the lifted code), uploaded once to a release tagged r36s-guest-objs (pre-release) with
+#     bash scripts/publish_guest_objs.sh
+# (the NFSU1 counterpart of NFSU2's "build.py --export-guest --publish"; run it again whenever the game code is
+# rebuilt). Lookup order: 1. the repository secret GUEST_OBJS_URL (a direct link to a tar.gz), if set;
+# 2. the .tar.gz asset of the release r36s-guest-objs.
 # A release asset of a public repository is public, so that archive (and the binary in the bundle) are
-# downloadable by anyone: they are derived from the game's code. Leave include_binary off to publish the
-# launcher-only bundle.
+# downloadable by anyone: they are derived from the game's code.
 
 on:
+  push:
+    tags:
+      - 'r36s-v*'
   workflow_dispatch:
     inputs:
       tag_name:
@@ -33,7 +37,7 @@ on:
         default: ''
         type: string
       include_binary:
-        description: 'Build nfsu.aarch64 from the guest objects (release r36s-guest-objs or the GUEST_OBJS_URL secret) and include it'
+        description: 'Build nfsu.aarch64 from the guest objects (release r36s-guest-objs, made by scripts/publish_guest_objs.sh, or the GUEST_OBJS_URL secret) and include it'
         required: false
         default: false
         type: boolean
@@ -54,10 +58,11 @@ jobs:
     permissions:
       contents: write
     env:
-      TAG_NAME: ${{ inputs.tag_name }}
+      TAG_NAME: ${{ inputs.tag_name || github.ref_name }}
+      EVENT: ${{ github.event_name }}
       RELEASE_TITLE: ${{ inputs.release_title }}
       BUILD_ID_INPUT: ${{ inputs.build_id }}
-      INCLUDE_BINARY: ${{ inputs.include_binary }}
+      INCLUDE_INPUT: ${{ inputs.include_binary }}
       GUEST_OBJS_URL: ${{ secrets.GUEST_OBJS_URL }}
     steps:
       - name: Checkout
@@ -72,8 +77,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu zip
 
+      - name: Decide whether to build the binary
+        run: |
+          # tag push: build it when the guest objects are found; manual run: only when include_binary is ticked (then they are required)
+          if [ "$EVENT" = "push" ]; then MODE=auto; elif [ "$INCLUDE_INPUT" = "true" ]; then MODE=required; else MODE=off; fi
+          echo "MODE=$MODE" >> "$GITHUB_ENV"
+          echo "binary mode: $MODE"
+
       - name: Build nfsu.aarch64 from the guest objects
-        if: ${{ inputs.include_binary }}
+        if: ${{ env.MODE != 'off' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -89,7 +101,11 @@ jobs:
             gh release download r36s-guest-objs -p '*.tar.gz' -D build/guest-archives --repo "$GITHUB_REPOSITORY" && FOUND=true || true
           fi
           if [ "$FOUND" = "false" ]; then
-            echo "::error::Guest objects not found. Upload guest-objs.tar.gz to a release tagged r36s-guest-objs (pre-release), or set the secret GUEST_OBJS_URL."
+            if [ "$MODE" = "auto" ]; then
+              echo "::warning::Guest objects not found (release r36s-guest-objs or secret GUEST_OBJS_URL): publishing the bundle without the binary."
+              exit 0
+            fi
+            echo "::error::Guest objects not found. Run scripts/publish_guest_objs.sh (release r36s-guest-objs), or set the secret GUEST_OBJS_URL."
             exit 1
           fi
           for archive in build/guest-archives/*.tar.gz; do tar -xzf "$archive" -C build/guest-objs; done
@@ -104,7 +120,7 @@ jobs:
       - name: Package the PortMaster bundle
         run: |
           set -e
-          if [ "$INCLUDE_BINARY" = "true" ]; then export BINARY="$GITHUB_WORKSPACE/build/out/nfsu.aarch64"; fi
+          if [ -f build/out/nfsu.aarch64 ]; then export BINARY="$GITHUB_WORKSPACE/build/out/nfsu.aarch64"; fi
           bash ports/r36s/package_release.sh
 
       - name: Write the release notes
@@ -122,7 +138,7 @@ jobs:
             echo "2. Copy your own retail PC game files (patch 1.4: \`Speed.exe\`, \`GLOBAL\`, \`CARS\`, \`TRACKS\`, \`SOUND\`, \`MOVIES\`, ...) into \`ports/nfsu/gamedata/\`."
             echo "3. Start it from the Ports menu. Settings are in \`nfsu/nfsu.cfg\`; see \`nfsu/README.md\`."
             echo
-            if [ "$INCLUDE_BINARY" != "true" ]; then
+            if [ ! -f build/out/nfsu.aarch64 ]; then
               echo "> This bundle does **not** include the game binary \`nfsu.aarch64\`; it has to be built from your own copy of the game (see the README)."
               echo
             fi
@@ -132,9 +148,9 @@ jobs:
       - name: Publish the release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag_name }}
-          name: ${{ inputs.release_title != '' && inputs.release_title || format('NFSU1 R36S {0}', inputs.tag_name) }}
-          draft: ${{ inputs.draft }}
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
+          name: ${{ inputs.release_title != '' && inputs.release_title || format('NFSU1 R36S {0}', inputs.tag_name || github.ref_name) }}
+          draft: ${{ inputs.draft || false }}
           prerelease: false
           body_path: build/release_notes.md
           files: |
