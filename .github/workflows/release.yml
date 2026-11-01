@@ -4,13 +4,16 @@ name: Release R36S bundle
 # (launcher, settings, metadata, docs) and publishes it as a GitHub release, a draft by default.
 #
 # The game binary (nfsu.aarch64) contains the lifted game code, which is generated from Speed.exe and is
-# not in this repository. It is added to the bundle only when include_binary is ticked AND the repository
-# secret GUEST_OBJS_URL points at a tar.gz of the precompiled guest objects (*.o). Create that archive on
-# the machine where you built the game, and host it somewhere private (a secret URL), not in a public
-# release:
+# not in this repository. As in the NFSU2 repository, it is built here from precompiled guest objects
+# (the *.o of the lifted code) when include_binary is ticked. The objects are looked up in this order:
+#   1. the repository secret GUEST_OBJS_URL (a direct link to a tar.gz of the *.o files), if set;
+#   2. a release of this repository tagged r36s-guest-objs with a .tar.gz asset (mark it as a pre-release).
+# Create the archive on the machine where the game was built:
 #     tar czf guest-objs.tar.gz -C build/r36s-vm/guest .
-# Publishing a bundle with the binary distributes code derived from the game: that is your decision; leave
-# include_binary off to publish the launcher-only bundle.
+#     gh release create r36s-guest-objs guest-objs.tar.gz --prerelease --title "Guest objects (CI input)" --notes "Precompiled guest objects for the CI build"
+# A release asset of a public repository is public, so that archive (and the binary in the bundle) are
+# downloadable by anyone: they are derived from the game's code. Leave include_binary off to publish the
+# launcher-only bundle.
 
 on:
   workflow_dispatch:
@@ -30,7 +33,7 @@ on:
         default: ''
         type: string
       include_binary:
-        description: 'Build nfsu.aarch64 from the guest objects in the GUEST_OBJS_URL secret and include it'
+        description: 'Build nfsu.aarch64 from the guest objects (release r36s-guest-objs or the GUEST_OBJS_URL secret) and include it'
         required: false
         default: false
         type: boolean
@@ -71,15 +74,25 @@ jobs:
 
       - name: Build nfsu.aarch64 from the guest objects
         if: ${{ inputs.include_binary }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
-          if [ -z "$GUEST_OBJS_URL" ]; then
-            echo "::error::include_binary needs the repository secret GUEST_OBJS_URL (a direct link to a tar.gz of the guest *.o files)"
+          mkdir -p build/guest-archives build/guest-objs build/out
+          FOUND=false
+          if [ -n "$GUEST_OBJS_URL" ]; then
+            echo "Downloading the guest objects from the GUEST_OBJS_URL secret..."
+            curl -fsSL "$GUEST_OBJS_URL" -o build/guest-archives/guest-objs.tar.gz && FOUND=true
+          fi
+          if [ "$FOUND" = "false" ]; then
+            echo "Looking for the guest objects in the release 'r36s-guest-objs'..."
+            gh release download r36s-guest-objs -p '*.tar.gz' -D build/guest-archives --repo "$GITHUB_REPOSITORY" && FOUND=true || true
+          fi
+          if [ "$FOUND" = "false" ]; then
+            echo "::error::Guest objects not found. Upload guest-objs.tar.gz to a release tagged r36s-guest-objs (pre-release), or set the secret GUEST_OBJS_URL."
             exit 1
           fi
-          mkdir -p build/guest-objs build/out
-          curl -fsSL "$GUEST_OBJS_URL" -o build/guest-objs.tar.gz
-          tar -xzf build/guest-objs.tar.gz -C build/guest-objs
+          for archive in build/guest-archives/*.tar.gz; do tar -xzf "$archive" -C build/guest-objs; done
           COUNT="$(find build/guest-objs -name '*.o' | wc -l | tr -d ' ')"
           [ "$COUNT" -gt 0 ] || { echo "::error::no *.o files in the guest objects archive"; exit 1; }
           echo "Found $COUNT guest objects."
