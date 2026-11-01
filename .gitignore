@@ -11,3 +11,14 @@ android/.gradle/
 android/app/.cxx/
 android/local.properties
 widescreenfix/
+
+# Local tool state and scratch (never commit)
+.agents/
+.claude/
+.opencode/
+KIMI_V7_CHECK_PROMPT.md
+/*.png
+
+# Compiled game binaries (derived from the game code), their debug copies and update parts: never commit
+*.aarch64
+*.aarch64.*

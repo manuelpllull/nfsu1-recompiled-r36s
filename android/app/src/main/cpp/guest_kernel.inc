@@ -6,6 +6,12 @@ void setErrorMode(){uint32_t old=processErrorMode;processErrorMode=arg(0);ret(ol
 std::array<bool,1088> tlsUsed{};
 thread_local std::array<uint32_t,1088> tlsValues{};
 std::map<uint32_t,std::shared_ptr<std::recursive_mutex>> criticalSections;
+// Guards criticalSections and pendingCriticalDeletes: Enter/LeaveCriticalSection also run on the free
+// sound thread without the guest machine (R36S). The sections themselves are real host mutexes.
+std::mutex criticalMapMutex;
+std::shared_ptr<std::recursive_mutex> findCritical(uint32_t address){
+    std::lock_guard<std::mutex> l(criticalMapMutex);auto cs=criticalSections.find(address);return cs==criticalSections.end()?nullptr:cs->second;
+}
 std::map<uint32_t,bool> pendingCriticalDeletes;
 uint32_t ansiString(const std::string& value) {
     auto address=allocate(static_cast<uint32_t>(value.size()+1));
@@ -35,6 +41,7 @@ void tlsFree() { uint32_t i=arg(0); bool ok=i<tlsUsed.size() && tlsUsed[i]; if(o
 void tlsGet() {uint32_t i=arg(0); if(i>=tlsUsed.size()||!tlsUsed[i]){lastError=87;ret(0,1);}else{lastError=0;ret(tlsValues[i],1);}}
 void tlsSet() {uint32_t i=arg(0); if(i>=tlsUsed.size()||!tlsUsed[i]){lastError=87;ret(0,2);}else{tlsValues[i]=arg(1);ret(1,2);}}
 void initCritical(uint32_t address,uint32_t spin) {
+    std::lock_guard<std::mutex> l(criticalMapMutex);
     if(criticalSections.count(address)&&read32(address+8))throw GuestStop("Reinitializing active critical section");
     pendingCriticalDeletes.erase(address);
     criticalSections[address]=std::make_shared<std::recursive_mutex>();
@@ -43,47 +50,102 @@ void initCritical(uint32_t address,uint32_t spin) {
 void initializeCritical() {initCritical(arg(0),0);ret(0,1);}
 void initializeCriticalSpin() {initCritical(arg(0),arg(1));ret(1,2);}
 void enterCritical() {
-    uint32_t address=arg(0); auto cs=criticalSections.find(address);
-    if(cs==criticalSections.end()){
+    uint32_t address=arg(0); auto mutex=findCritical(address);
+    if(!mutex){
         // A CRITICAL_SECTION copied by value after InitializeCriticalSection keeps
         // its state in the struct, and Windows accepts it: LockCount -1 (unlocked),
         // no recursion, no owner. Adopt exactly that; anything else is a real bug.
         if(read32(address+4)==UINT32_MAX&&read32(address+8)==0&&read32(address+12)==0){
             static unsigned adopted=0;
             if(++adopted<=8)NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU1","Adopting copied critical section %08x from %08x",address,g_cur_func);
-            criticalSections[address]=std::make_shared<std::recursive_mutex>();
-            cs=criticalSections.find(address);
+            {std::lock_guard<std::mutex> l(criticalMapMutex);auto& slot=criticalSections[address];if(!slot)slot=std::make_shared<std::recursive_mutex>();mutex=slot;}
         }else{
             std::ostringstream dump;for(unsigned i=0;i<24;i+=4)dump<<' '<<hex(read32(address+i));
             throw GuestStop("EnterCriticalSection without initialization: "+hex(address)+" from "+hex(g_cur_func)+" words"+dump.str());
         }
     }
-    auto mutex=cs->second;
     // Contended: hand the machine over (the fair lock gives it to the waiting
     // owner) instead of sleeping 1 ms per attempt; sleep only if it persists.
+    static const bool reportLongWaits=std::getenv("NFSU2_HANG_DUMP")!=nullptr;
+    auto waitStart=std::chrono::steady_clock::now();bool reported=false;
+    const bool timeIt=nfsIsGameThread();std::chrono::steady_clock::time_point csStart;bool contended=false;
     if(!mutex->try_lock()){
         WaitScope scope("EnterCriticalSection",address);
-        for(unsigned spins=0;!mutex->try_lock();++spins){checkGuestProgress();yieldGuestMachine(spins<64?0:1);}
+        for(uint64_t gen=guestSyncGeneration.load();!mutex->try_lock();gen=guestSyncGeneration.load()){
+            if(timeIt&&!contended){contended=true;csStart=std::chrono::steady_clock::now();}
+            if(reportLongWaits&&!reported&&std::chrono::steady_clock::now()-waitStart>std::chrono::seconds(8)){reported=true;
+                NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","LONG WAIT guest thread %u on critical section %08x owned by guest thread %u (count %u)",guestThreadId,address,read32(address+12),read32(address+8));}
+
+            // Deadlock cycle detection & resolution:
+            uint32_t owner = memory && memory->readable(address + 12, 4) ? read32(address + 12) : 0;
+            if(owner != 0 && owner != guestThreadId) {
+                uint32_t ownerWaitsFor = 0;
+                {
+                    std::lock_guard<std::mutex> lock(threadTracesMutex);
+                    auto it = threadTraces.find(owner);
+                    if(it != threadTraces.end() && it->second) {
+                        const char* wait = it->second->wait.load(std::memory_order_relaxed);
+                        if(wait && !std::strcmp(wait, "EnterCriticalSection")) {
+                            uint32_t w = it->second->handle.load(std::memory_order_relaxed);
+                            if(w != 0 && currentTrace().holds(w)) {
+                                ownerWaitsFor = w;
+                            }
+                        }
+                    }
+                }
+                if(ownerWaitsFor != 0) {
+                    NFS_RUNTIME_LOG(ANDROID_LOG_WARN, "NFSU2",
+                        "Deadlock cycle detected: thread %u holds %08x wanting %08x; thread %u holds %08x wanting %08x. Resolving by yielding %08x.",
+                        guestThreadId, ownerWaitsFor, address, owner, address, ownerWaitsFor, ownerWaitsFor);
+                    auto heldMutex = findCritical(ownerWaitsFor);
+                    if(heldMutex) {
+                        uint32_t savedCount = memory && memory->readable(ownerWaitsFor + 8, 4) ? read32(ownerWaitsFor + 8) : 1;
+                        if(savedCount == 0) savedCount = 1;
+                        write32(ownerWaitsFor + 8, 0);
+                        write32(ownerWaitsFor + 4, UINT32_MAX);
+                        write32(ownerWaitsFor + 12, 0);
+                        currentTrace().release(ownerWaitsFor);
+                        for(uint32_t i = 0; i < savedCount; ++i) heldMutex->unlock();
+                        notifyGuestSync();
+
+                        while(!mutex->try_lock()) {
+                            checkGuestProgress();
+                            waitGuestSync(guestSyncGeneration.load(), 2, [&]{ return read32(address + 8) == 0; });
+                        }
+
+                        for(uint32_t i = 0; i < savedCount; ++i) heldMutex->lock();
+                        write32(ownerWaitsFor + 8, savedCount);
+                        write32(ownerWaitsFor + 4, savedCount - 1);
+                        write32(ownerWaitsFor + 12, guestThreadId);
+                        currentTrace().hold(ownerWaitsFor);
+                        break;
+                    }
+                }
+            }
+
+            checkGuestProgress();waitGuestSync(gen,4,[&]{return read32(address+8)==0;});}
     }
-    cs=criticalSections.find(address);
-    if(cs==criticalSections.end()||cs->second!=mutex){mutex->unlock();throw GuestStop("Critical section deleted while waiting");}
+    if(findCritical(address)!=mutex){mutex->unlock();throw GuestStop("Critical section deleted while waiting");}
+    if(contended){const uint64_t ns=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-csStart).count();
+        nfsWaitAdd(6,ns);nfsCsWait(address,ns);}
     auto count=read32(address+8)+1; write32(address+8,count); write32(address+4,count-1); write32(address+12,guestThreadId);
     if(count==1)currentTrace().hold(address);
     ret(0,1);
 }
 void leaveCritical() {
-    uint32_t address=arg(0); auto cs=criticalSections.find(address); uint32_t count=read32(address+8);
-    if(cs==criticalSections.end()||!count||read32(address+12)!=guestThreadId) throw GuestStop("Unbalanced LeaveCriticalSection");
-    write32(address+8,--count);write32(address+4,count-1);if(!count){write32(address+12,0);currentTrace().release(address);}cs->second->unlock();
-    if(!count&&pendingCriticalDeletes.erase(address))criticalSections.erase(cs);
+    uint32_t address=arg(0); auto mutex=findCritical(address); uint32_t count=read32(address+8);
+    if(!mutex||!count||read32(address+12)!=guestThreadId) throw GuestStop("Unbalanced LeaveCriticalSection");
+    write32(address+8,--count);write32(address+4,count-1);if(!count){write32(address+12,0);currentTrace().release(address);}mutex->unlock();
+    if(!count)notifyGuestSync();
+    if(!count){std::lock_guard<std::mutex> l(criticalMapMutex);if(pendingCriticalDeletes.erase(address))criticalSections.erase(address);}
     ret(0,1);
 }
 void deleteCritical() {
     uint32_t address=arg(0);
     if(read32(address+8)){
         NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU1","Deferring deletion of active guest critical section %08x owner=%u count=%u",address,read32(address+12),read32(address+8));
-        pendingCriticalDeletes[address]=true;
-    }else{criticalSections.erase(address);pendingCriticalDeletes.erase(address);}
+        std::lock_guard<std::mutex> l(criticalMapMutex);pendingCriticalDeletes[address]=true;
+    }else{std::lock_guard<std::mutex> l(criticalMapMutex);criticalSections.erase(address);pendingCriticalDeletes.erase(address);}
     ret(0,1);
 }
 void startupInfo() {std::memset(ptr(arg(0),68),0,68);write32(arg(0),68);ret(0,1);}
@@ -93,7 +155,7 @@ void moduleHandleW() {
     if(!arg(0)){ret(imageBase,1);return;}
     auto chars=wideString(arg(0));std::string name;
     for(auto c:chars){if(c>127){lastError=126;ret(0,1);return;}name.push_back(static_cast<char>(c));}
-    name=lower(name);if(name=="speed2.exe"){ret(imageBase,1);return;}
+    name=lower(name);if(name=="speed.exe"||name=="speed2.exe"){ret(imageBase,1);return;}
     if(name.find('.')==std::string::npos)name+=".dll";
     auto found=modules.find(name);if(found==modules.end())lastError=126;ret(found==modules.end()?0:found->second,1);
 }
@@ -154,7 +216,29 @@ void cpInfo() {
 }
 uint64_t counter() {return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
 void tickCount() {ret(static_cast<uint32_t>(counter()/1000000),0);}
-void performanceCounter() {uint64_t now=counter();std::memcpy(ptr(arg(0),8),&now,8);ret(1,1);}
+// The game's main loop (sub_0057E760) busy-waits on QueryPerformanceCounter until its next tick. On a
+// handheld that spin only burns the CPU the other guest threads (audio) need, and in headless runs it
+// inflates the game thread's CPU time. After 64 consecutive reads with no D3D9 call in between (a
+// spin, not timing code), release the machine for 1 ms. (qpcStreak: guest_runtime.cpp)
+// Only a real spin counts: 64 reads in a row, each within 20 us of the previous one. The game also reads
+// the counter all through its simulation (timing code between stretches of work); on the R36S those reads
+// used to reach 64 too and slept 1 ms each time, about a third of every race frame.
+// A real spin also lasts: the streak must span 2 ms. Timing code (sub_00578A30 / sub_00578980 around physics
+// work) reads the counter dozens of times in quick succession; with the count alone it slept 1 ms several
+// times per race frame (~1.4% of the game thread, and 30+ ms sleep hitches).
+uint64_t qpcRead() {
+    uint64_t now=counter();
+    static thread_local uint64_t lastRead=0,streakStart=0;
+    if(now-lastRead>20000)qpcStreak=0;
+    if(!qpcStreak)streakStart=now;
+    lastRead=now;
+    if(++qpcStreak>=64&&now-streakStart>=2000000){
+        qpcStreak=0;if(nfsIsGameThread())nfsWaitAdd(7,1000000);
+        yieldGuestMachine(1);now=counter();lastRead=now;  // without the machine (parallel guest): a plain 1 ms sleep
+    }
+    return now;
+}
+void performanceCounter() {const uint64_t now=qpcRead();std::memcpy(ptr(arg(0),8),&now,8);ret(1,1);}
 void performanceFrequency() {uint64_t frequency=1000000000;std::memcpy(ptr(arg(0),8),&frequency,8);ret(1,1);}
 void systemFileTime() {uint64_t ticks=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count()/100)+116444736000000000ull;std::memcpy(ptr(arg(0),8),&ticks,8);ret(0,1);}
 void fileTimeToLocalFileTime(){
@@ -180,11 +264,13 @@ void systemInfo() {uint32_t out=arg(0);std::memset(ptr(out,36),0,36);write32(out
 void sleepShim() {
     uint32_t ms=arg(0);if(ms==UINT32_MAX)throw GuestStop("Infinite Sleep requires guest scheduler");
     WaitScope scope("Sleep",ms);
+    if(ms&&nfsIsGameThread())nfsWaitAdd(7,uint64_t(ms)*1000000ull);
     while(ms){checkGuestProgress();auto chunk=std::min(ms,50u);yieldGuestMachine(chunk);ms-=chunk;}
     ret(0,1);
 }
 void sleepEx(){
     uint32_t ms=arg(0);if(!ms){checkGuestProgress();ret(0,2);return;}
+    if(nfsIsGameThread()&&ms!=UINT32_MAX)nfsWaitAdd(7,uint64_t(ms)*1000000ull);
     while(ms){checkGuestProgress();auto chunk=std::min(ms,50u);yieldGuestMachine(chunk);if(ms!=UINT32_MAX)ms-=chunk;}
     ret(0,2);
 }
@@ -287,7 +373,7 @@ void processEntry(bool first){
     snapshot->second.processConsumed=true;ret(1,2);
 }
 void processFirst(){processEntry(true);}void processNext(){processEntry(false);}
-void closeHandle(){if(closeGuestFile(arg(0))||moduleSnapshots.erase(arg(0))||kernelHandleAliases.erase(arg(0))||threadHandles.erase(arg(0))||eventHandles.erase(arg(0))||mutexHandles.erase(arg(0))){ret(1,1);return;}lastError=6;ret(0,1);}
+void closeHandle(){if(closeGuestFile(arg(0))||moduleSnapshots.erase(arg(0))||kernelHandleAliases.erase(arg(0))||threadHandles.erase(arg(0))||eventHandles.erase(arg(0))||eraseGuestMutex(arg(0))){ret(1,1);return;}lastError=6;ret(0,1);}
 struct RegistryValue {uint32_t type;std::vector<uint8_t> bytes;};
 std::map<std::string,RegistryValue> gameRegistry;
 // The game keeps its video options in the registry (g_CarLodLevel,
@@ -297,7 +383,11 @@ std::map<std::string,RegistryValue> gameRegistry;
 // value that crashes a GPU cannot crash every following start.
 std::string registryFile(){return hostGameRoot+"/android_registry.dat";}
 bool registryPersisted(const std::string& name){
+#if defined(NFS_R36S)
+    (void)name;return false;   // R36S: the graphics options come from nfsu.cfg / NFSU2_REGISTRY, not from an earlier session
+#else
     return name!="install dir"&&name!="language"&&name!="g_racingresolution"&&name!="g_fsaalevel";
+#endif
 }
 void loadPersistedRegistry(){
     std::ifstream file(registryFile(),std::ios::binary);if(!file)return;
@@ -330,12 +420,29 @@ uint32_t nextRegistryHandle=0xf0050000;
 void registryOpen(uint32_t output,uint32_t argc){
     auto key=lower(guestString(arg(1)));
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU1","Registry open %08x\\%s",arg(0),key.c_str());
-    if(arg(0)!=0x80000002u||(key!="software\\ea games\\need for speed underground"&&key!="software\\ea games\\nfs underground")){
+    if(arg(0)!=0x80000002u||(key.find("need for speed underground")==std::string::npos&&key.find("nfs underground")==std::string::npos)){
         if(output)write32(output,0);ret(2,argc);return;
     }
     if(gameRegistry.empty()){
         const char path[]="C:\\nfsu1\\";gameRegistry.emplace("install dir",RegistryValue{1,{std::begin(path),std::end(path)}});
         auto language=guestLanguage;language.push_back('\0');gameRegistry.emplace("language",RegistryValue{1,{language.begin(),language.end()}});
+        // Optional defaults for the game's own option values (DWORDs), e.g. the PC graphics options:
+        // NFSU2_REGISTRY="g_TextureFiltering=2;g_FogEnable=1". Names are case-insensitive. Values the game
+        // writes later (RegSetValueEx) override these for the rest of the session.
+        if(const char* defaults=std::getenv("NFSU2_REGISTRY")){
+            std::string all(defaults);size_t start=0;
+            while(start<all.size()){
+                size_t end=all.find(';',start);if(end==std::string::npos)end=all.size();
+                std::string item=all.substr(start,end-start);size_t eq=item.find('=');
+                if(eq!=std::string::npos&&eq>0){
+                    uint32_t v=static_cast<uint32_t>(std::strtoul(item.c_str()+eq+1,nullptr,0));
+                    std::vector<uint8_t> bytes(4);std::memcpy(bytes.data(),&v,4);
+                    gameRegistry[lower(item.substr(0,eq))]=RegistryValue{4,std::move(bytes)};
+                    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Registry default %s=%u",lower(item.substr(0,eq)).c_str(),v);
+                }
+                start=end+1;
+            }
+        }
         loadPersistedRegistry();
     }
     uint32_t handle=nextRegistryHandle++;registryHandles.emplace(handle,true);write32(output,handle);ret(0,argc);

@@ -36,8 +36,23 @@ private:
     }
 public:
     GuestMemory() {
+#ifdef NFS_FIXED_GUEST_BASE
+        // Lifted code compiled with NFS_FIXED_GUEST_BASE adds this constant to every guest address
+        // (arm64_guest.h): the reservation must land exactly there.
+        void* want = reinterpret_cast<void*>(static_cast<uintptr_t>(NFS_FIXED_GUEST_BASE));
+        base_ = mmap(want, size_t(size), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (base_ != MAP_FAILED && base_ != want) { munmap(base_, size_t(size)); base_ = MAP_FAILED; }
+        if (base_ == MAP_FAILED) throw std::runtime_error("Guest address space could not be reserved at the fixed base");
+#else
         base_ = mmap(nullptr, size_t(size), PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (base_ == MAP_FAILED) throw std::runtime_error("Guest address-space reservation failed");
+#endif
+#ifdef MADV_HUGEPAGE
+        // The game's working set is hundreds of MB of pointer-chasing data. With 4 KB pages an in-order
+        // Cortex-A35 (R36S) spends much of its time on TLB misses; 2 MB pages cover the same data with
+        // 512x fewer entries. Only a hint: ignored where transparent huge pages are disabled.
+        madvise(base_, size_t(size), MADV_HUGEPAGE);
+#endif
     }
     GuestMemory(const GuestMemory&) = delete;
     GuestMemory& operator=(const GuestMemory&) = delete;

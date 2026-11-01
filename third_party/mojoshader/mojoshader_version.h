@@ -1,0 +1,5 @@
+#ifndef _INCL_MOJOSHADER_VERSION_H_
+#define _INCL_MOJOSHADER_VERSION_H_
+#define MOJOSHADER_VERSION -1
+#define MOJOSHADER_CHANGESET "git-main"
+#endif

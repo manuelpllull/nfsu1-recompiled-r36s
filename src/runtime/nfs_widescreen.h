@@ -10,11 +10,16 @@ void nfs_widescreen_init(const char* game_root);
 /* Display width/height (> 4:3 turns the fix on: render size widened, 3D FOV
  * corrected); 0 keeps the original 4:3 game. */
 void nfs_widescreen_set_display_aspect(float aspect);
+/* R36S: the render size the game must use (the panel's, or a scaled/4:3 one), whatever its
+ * resolution menu says; 0x0 keeps the game's choice. Call before the device is created. */
+void nfs_widescreen_set_render_size(unsigned width, unsigned height);
 /* The game's render size; call before its HUD draws and on every change. */
 void nfs_widescreen_set_resolution(unsigned width, unsigned height);
 /* Touch hosts (Android): the mouse cursor is handed out in front-end units,
  * so its clamp spans the wide HUD space (see nfs_widescreen_hud_pos_x). */
 void nfs_frontend_cursor_units(int on);
+/* Hosts without a pointing device (R36S): the front-end mouse arrow is drawn off screen. */
+void nfs_widescreen_hide_cursor(int on);
 /* fHudPosX: the FE/HUD centre; the visible FE space is 320 -/+ this value. */
 float nfs_widescreen_hud_pos_x(void);
 /* HUD offset entries loaded from the .dat (0: elements keep 4:3 anchors). */

@@ -5,6 +5,7 @@
 // entry until the first unsupported host service. Returns an honest status.
 std::string connectGuestRuntime(const char* executable);
 void requestGuestRuntimeStop();
+void quiesceGuestFilesForExit(int timeoutMs);  // flush saves before quitting (see guest_runtime.cpp)
 void setGuestPaused(bool paused);
 void setGuestDisplaySize(unsigned width,unsigned height);
 void setGuestKey(unsigned scan,bool down);

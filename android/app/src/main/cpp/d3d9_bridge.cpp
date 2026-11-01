@@ -7,6 +7,7 @@
 #include <map>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <stdexcept>
 #ifdef __ANDROID__
@@ -15,23 +16,70 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <mutex>
 #include <cstdlib>
 
 extern "C" IDirect3D9* Direct3DCreate9(UINT sdk);
 extern "C" void dxvkAndroidSetWindow(ANativeWindow* window);
 extern "C" HWND dxvkAndroidGetWindowHandle();
 extern "C" void dxvkAndroidSetRenderSize(uint32_t width,uint32_t height);
-void setD3D9RenderSize(unsigned width,unsigned height){dxvkAndroidSetRenderSize(width,height);}
-#ifndef __ANDROID__
+
+#if !defined(NFS_R36S)
+extern "C" IDirect3D9* Direct3DCreate9_GLES(UINT sdk);
+extern "C" void glesAndroidSetWindow(void* window);
+extern "C" HWND glesAndroidGetWindowHandle();
+extern "C" void glesAndroidSetRenderSize(uint32_t width,uint32_t height);
+extern "C" uint32_t glesGetD3D9PresentCount();
+#endif
+
+static bool s_useGles = false;
+void setD3D9Renderer(const char* renderer) {
+    s_useGles = (renderer && std::strcmp(renderer, "gles") == 0);
+}
+bool isD3D9Gles() {
+    return s_useGles;
+}
+
+void setD3D9RenderSize(unsigned width,unsigned height){
+#if !defined(NFS_R36S)
+    if(s_useGles) glesAndroidSetRenderSize(width,height);
+    else
+#endif
+    dxvkAndroidSetRenderSize(width,height);
+}
+#if !defined(__ANDROID__) && !defined(NFS_R36S) && !defined(NFS_GLES)
 extern "C" ANativeWindow* dxvkCreateTestWindow();
 extern "C" void dxvkDestroyTestWindow(ANativeWindow* window);
 #endif
+namespace rt{void forgetBufferShadow(uint32_t address);void forgetTextureLocks(uint32_t address);}  // d3d9_render_thread.inc (R36S)
+extern thread_local bool g_glesDeferBufferGL;  // ports/r36s/d3d9_gles: buffers created off the render thread
+extern thread_local bool g_glesDeferTextureGL; // ports/r36s/d3d9_gles: 2D textures created off the render thread
+// ports/r36s/d3d9_gles: upload a whole level already decoded from DXT (false = use LockRect/UnlockRect)
+bool glesUploadDecodedLevel(IDirect3DTexture9* texture,uint32_t level,const uint8_t* rgba,const uint8_t* rgb565);
+// ports/r36s/d3d9_gles: one instanced DrawIndexedPrimitive (false = not drawn: draw the instances one by one)
+bool glesDrawIndexedInstanced(IDirect3DDevice9* device,const uint32_t* dip,const uint16_t* registers,uint32_t count,uint32_t instances,const float* data);
+// ports/r36s/d3d9_gles: consecutive DrawPrimitiveUP calls merged into one indexed triangle-list draw
+bool glesDrawUserTriangles(IDirect3DDevice9* device,const void* vertices,uint32_t vertexCount,const uint16_t* indices,uint32_t indexCount,uint32_t stride);
 namespace {
 constexpr uint32_t methodBase=0x7e000000;
 enum class Kind:uint32_t {D3D9=1,Device=2,Texture=3,Cube=4,Surface=5,VertexBuffer=6,IndexBuffer=7,
     VertexShader=8,PixelShader=9,Declaration=10,StateBlock=11,Query=12,SwapChain=13,VolumeTexture=14,Volume=15};
-struct Object {IUnknown* native;Kind kind;uint32_t references=1;CompressedView compressed;uint32_t parent=0;uint32_t children=0;};
+struct Object {IUnknown* native;Kind kind;uint32_t references=1;CompressedView compressed;uint32_t parent=0;uint32_t children=0;int32_t refDelta=0;bool refQueued=false;
+    uint32_t serial=0;  // unique per created guest object: a handle reused by a new object gets a new serial
+};
+std::recursive_mutex objectsMutex;
 std::unordered_map<uint32_t,Object> objects;
+// Bumped when a guest handle is retired: only then can a cached handle -> object entry (game-thread lookup caches,
+// redundant-call filter, HUD recording) name something else. Creating objects does not invalidate anything (the
+// game creates and releases dynamic buffers every frame; each bump used to empty every cache).
+std::atomic<uint64_t> handlesRetiredEpoch{0};
+// Learned draw records (src/runtime/world_cull.c) remember which texture object each recorded SetTexture bound.
+// After a world section loads, the game recreates its textures, often at reused guest handles: the records
+// compare serials (nfsD3dObjectSerial) whenever textureChurn moved, so a stale record is relearned instead of
+// replaying a handle that now names another texture, or a vertex buffer.
+std::atomic<uint32_t> textureChurn{0};  // texture objects created or retired so far
+uint32_t nextObjectSerial=1;            // under objectsMutex
+bool isTextureKind(Kind kind){return kind==Kind::Texture||kind==Kind::Cube||kind==Kind::VolumeTexture;}
 std::map<IUnknown*,uint32_t> addresses;
 void* guestBase;
 uint32_t (*allocateGuest)(uint32_t);
@@ -41,12 +89,19 @@ std::atomic<bool> surfaceRequested{false},surfaceAvailable{false};
 void* pointer(uint32_t address){return address?static_cast<uint8_t*>(guestBase)+address:nullptr;}
 void write(uint32_t address,uint32_t value){if(!address)throw std::runtime_error("Null D3D9 output");std::memcpy(pointer(address),&value,4);}
 uint32_t wrap(IUnknown* native,Kind kind){
-    if(!native)return 0;auto previous=addresses.find(native);if(previous!=addresses.end()){++objects.at(previous->second).references;return previous->second;}
+    if(!native)return 0;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto previous=addresses.find(native);if(previous!=addresses.end()){++objects.at(previous->second).references;return previous->second;}
     static constexpr uint32_t sizes[]={0,17,119,22,22,17,14,14,5,5,5,6,8,10,22,11};
-    uint32_t count=sizes[static_cast<uint32_t>(kind)];
-    uint32_t table=allocateGuest(count*4),object=allocateGuest(4);
-    for(uint32_t i=0;i<count;++i)write(table+i*4,methodBase+static_cast<uint32_t>(kind)*4096+i*16);
-    write(object,table);objects.emplace(object,Object{native,kind});addresses.emplace(native,object);return object;
+    // The guest object is a pointer to a method table whose entries are dispatch tokens (kind, method index).
+    const uint32_t methodCount=sizes[static_cast<uint32_t>(kind)];
+    const uint32_t methodTable=allocateGuest(methodCount*4),guestObject=allocateGuest(4);
+    for(uint32_t method=0;method<methodCount;++method)write(methodTable+method*4,methodBase+static_cast<uint32_t>(kind)*4096+method*16);
+    write(guestObject,methodTable);
+    Object& created=objects.emplace(guestObject,Object{native,kind}).first->second;
+    created.serial=nextObjectSerial++;
+    if(isTextureKind(kind))textureChurn.fetch_add(1,std::memory_order_release);
+    addresses.emplace(native,guestObject);return guestObject;
 }
 // The guest handle's kind decides the interface: D3D9 interfaces form single
 // inheritance chains from IUnknown, so once the kind matches, static_cast is
@@ -64,20 +119,50 @@ template<class T>bool kindMatches(Kind kind){
     else return false;
 }
 template<class T>T* nativeObject(uint32_t address){
-    if(!address)return nullptr;auto found=objects.find(address);if(found==objects.end())throw std::runtime_error("Invalid D3D9 resource handle");
+    if(!address)return nullptr;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto found=objects.find(address);
+    if(found==objects.end()){
+        static uint32_t warned=0;
+        if(warned++<20)NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","nativeObject: handle %08x not found in D3D9 objects map",address);
+        return nullptr;
+    }
     if(kindMatches<T>(found->second.kind))return static_cast<T*>(found->second.native);
-    auto native=dynamic_cast<T*>(found->second.native);if(!native)throw std::runtime_error("D3D9 resource interface mismatch");return native;
+    auto native=dynamic_cast<T*>(found->second.native);
+    if(!native){
+        static uint32_t warnedMismatch=0;
+        if(warnedMismatch++<20)NFS_RUNTIME_LOG(ANDROID_LOG_WARN,"NFSU2","nativeObject: interface mismatch for handle %08x kind %u",address,static_cast<uint32_t>(found->second.kind));
+        return nullptr;
+    }
+    return native;
 }
 uint32_t wrapTexture(IDirect3DBaseTexture9* texture){if(!texture)return 0;switch(texture->GetType()){case D3DRTYPE_TEXTURE:return wrap(texture,Kind::Texture);case D3DRTYPE_CUBETEXTURE:return wrap(texture,Kind::Cube);case D3DRTYPE_VOLUMETEXTURE:return wrap(texture,Kind::VolumeTexture);default:throw std::runtime_error("Unknown D3D9 base texture type");}}
 void retireGuestObject(uint32_t address){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     auto found=objects.find(address);if(found==objects.end())return;
-    uint32_t table;std::memcpy(&table,pointer(address),4);
-    freeGuest(table);freeGuest(address);addresses.erase(found->second.native);objects.erase(found);
+#if defined(NFS_R36S)
+    if(found->second.kind==Kind::VertexBuffer||found->second.kind==Kind::IndexBuffer)::rt::forgetBufferShadow(address);
+    if(found->second.kind==Kind::Texture)::rt::forgetTextureLocks(address);
+#endif
+    if(isTextureKind(found->second.kind))textureChurn.fetch_add(1,std::memory_order_release);
+    uint32_t methodTable;std::memcpy(&methodTable,pointer(address),4);
+    freeGuest(methodTable);freeGuest(address);addresses.erase(found->second.native);objects.erase(found);handlesRetiredEpoch.fetch_add(1,std::memory_order_release);
 }
+}  // namespace
+extern "C" uint32_t nfsD3dTextureChurn(){return textureChurn.load(std::memory_order_acquire);}
+// 0 = no such guest object
+extern "C" uint32_t nfsD3dObjectSerial(uint32_t handle){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto found=objects.find(handle);return found==objects.end()?0u:found->second.serial;
+}
+namespace {
 void attachTextureSurface(uint32_t texture,uint32_t surface){
     if(!surface)return;
-    auto& child=objects.at(surface);
-    if(!child.parent){child.parent=texture;++objects.at(texture).children;}
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto itChild=objects.find(surface);if(itChild==objects.end())return;
+    auto itParent=objects.find(texture);if(itParent==objects.end())return;
+    auto& child=itChild->second;
+    if(!child.parent){child.parent=texture;++itParent->second.children;}
     else if(child.parent!=texture)throw std::runtime_error("D3D9 subresource changed parent");
 }
 // Underground 2 copies its initial depth surface from 0x870854 into the first
@@ -85,11 +170,16 @@ void attachTextureSurface(uint32_t texture,uint32_t surface){
 // The copy does not call AddRef, so account for that owned descriptor here.
 void retainInitialDepthDescriptor(uint32_t outputAddress,uint32_t surfaceAddress){
     if(outputAddress!=0x870854||!surfaceAddress)return;
-    auto& surface=objects.at(surfaceAddress);surface.native->AddRef();++surface.references;
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto it=objects.find(surfaceAddress);
+    if(it!=objects.end()){it->second.native->AddRef();++it->second.references;}
 }
 float floatValue(uint32_t bits){float value;std::memcpy(&value,&bits,4);return value;}
 uint32_t floatBits(float value){uint32_t bits;std::memcpy(&bits,&value,4);return bits;}
-CompressedView compressionView(uint32_t address){auto found=objects.find(address);return found==objects.end()?CompressedView{}:found->second.compressed;}
+CompressedView compressionView(uint32_t address){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
+    auto found=objects.find(address);return found==objects.end()?CompressedView{}:found->second.compressed;
+}
 // DXVK lets the CPU run at most BackBufferCount+1 frames ahead of the GPU.
 // Fewer back buffers (the game's request is logged) serialise a CPU-heavy frame
 // with its GPU work (Present waited 7-10 ms with the GPU 67% busy). Two
@@ -136,11 +226,22 @@ void configureD3D9Bridge(void* base,uint32_t (*allocator)(uint32_t),void (*deall
     if(!std::getenv("DXVK_STATE_CACHE_PATH"))setenv("DXVK_STATE_CACHE","0",1);
     setenv("DXVK_LOG_PATH","none",1);
 #endif
-#ifndef __ANDROID__
+#if !defined(__ANDROID__) && !defined(NFS_R36S) && !defined(NFS_GLES)
     if(std::getenv("NFS_D3D9_TEST_DISPLAY")){auto window=dxvkCreateTestWindow();if(!window)throw std::runtime_error("Xlib test display unavailable");setD3D9HostWindow(window);acknowledgeD3D9Surface(true);}
 #endif
 }
+#if defined(NFS_R36S)
+namespace rt {void stop();void runOnRenderThread(std::function<void()> fn);}
+#endif
+static void shutdownD3D9BridgeNow();
 void shutdownD3D9Bridge(){
+#if defined(NFS_R36S)
+    rt::runOnRenderThread([]{shutdownD3D9BridgeNow();});rt::stop();return;
+#endif
+    shutdownD3D9BridgeNow();
+}
+static void shutdownD3D9BridgeNow(){
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     for(auto& lock:resourceLocks)freeGuest(lock.second.guest);resourceLocks.clear();
     for(uint32_t kind=15;kind;--kind)for(auto it=objects.begin();it!=objects.end();){
         if(static_cast<uint32_t>(it->second.kind)!=kind){++it;continue;}
@@ -148,17 +249,40 @@ void shutdownD3D9Bridge(){
         uint32_t table;std::memcpy(&table,pointer(it->first),4);freeGuest(table);freeGuest(it->first);addresses.erase(object.native);it=objects.erase(it);
     }
     surfaceRequested=false;surfaceAvailable=false;
-#ifndef __ANDROID__
+#if !defined(__ANDROID__) && !defined(NFS_R36S) && !defined(NFS_GLES)
     if(std::getenv("NFS_D3D9_TEST_DISPLAY")){auto window=hostWindow.load();setD3D9HostWindow(nullptr);dxvkDestroyTestWindow(window);}
 #endif
 }
-void setD3D9HostWindow(ANativeWindow* window){hostWindow=window;dxvkAndroidSetWindow(window);}
+void setD3D9HostWindow(ANativeWindow* window){
+    hostWindow=window;
+#if !defined(NFS_R36S)
+    if(s_useGles) glesAndroidSetWindow(window);
+    else
+#endif
+    dxvkAndroidSetWindow(window);
+}
 bool d3d9RequestsSurface(){return surfaceRequested;}
 void acknowledgeD3D9Surface(bool available){surfaceAvailable=available;}
+#if defined(NFS_R36S)
+namespace rt {void start();void runOnRenderThread(std::function<void()> fn);void stop();}
+#endif
 uint32_t createGuestD3D9(uint32_t sdk){
+#if defined(NFS_R36S)
+    rt::start();
+    uint32_t created=0;
+    rt::runOnRenderThread([&]{auto native=Direct3DCreate9(sdk);created=wrap(native,Kind::D3D9);});
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Direct3DCreate9 sdk=%u (render thread)",sdk);
+    return created;
+#else
+    if(s_useGles) {
+        auto native = Direct3DCreate9_GLES(sdk);
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","GLES native Direct3DCreate9 sdk=%u",sdk);
+        return wrap(native,Kind::D3D9);
+    }
     auto native=Direct3DCreate9(sdk);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU1","DXVK native Direct3DCreate9 sdk=%u",sdk);
     return wrap(native,Kind::D3D9);
+#endif
 }
 // Logs each vertex declaration type the first time the game uses it, flagging the
 // ones this GPU cannot fetch (see vertex_formats.h): the evidence for stretched geometry.
@@ -191,8 +315,29 @@ std::vector<D3DDISPLAYMODE> adapterModes(IDirect3D9* d3d,UINT adapter,D3DFORMAT 
 // crash (null dereference, Mali reports); until a Reset succeeds the device reads as
 // lost and needing a reset, which the game handles as on Windows.
 bool deviceResetPending=false;
-uint32_t dispatchGuestD3D9(uint32_t token,const uint32_t* args,uint32_t* argumentCount){
+static std::atomic<uint32_t> s_presentCount{0};
+#if defined(NFS_R36S)
+extern "C" uint32_t getD3D9PresentCount();   // d3d9_gles.cpp
+#else
+extern "C" uint32_t getD3D9PresentCount() {
+    if(s_useGles) return glesGetD3D9PresentCount();
+    return s_presentCount.load(std::memory_order_relaxed);
+}
+#endif
+static uint32_t dispatchGuestD3D9Inner(uint32_t token,const uint32_t* args,uint32_t* argumentCount){
     uint32_t kind=(token-methodBase)/4096,method=((token-methodBase)%4096)/16;
+    // Diagnostics: NFSU2_COM_HISTO=N prints how often each COM method was called every N presents.
+    static const uint32_t histoEvery=[]{const char* e=std::getenv("NFSU2_COM_HISTO");return e?uint32_t(std::atoi(e)):0u;}();
+    static uint32_t histo[4096];static uint32_t presents=0;
+    if(histoEvery){histo[((token-methodBase)/16)&4095]++;
+        if(kind==2&&method==17&&++presents%histoEvery==0){
+            for(uint32_t i=0;i<4096;++i)if(histo[i])NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","COM histo present=%u kind=%u method=%u calls=%u",presents,i/256,i%256,histo[i]);
+            std::memset(histo,0,sizeof(histo));}}
+    // Diagnostics: NFSU2_COM_SEQ=<present index> logs every COM call made during that frame.
+    static const int seqFrame=[]{const char* e=std::getenv("NFSU2_COM_SEQ");return e?std::atoi(e):-1;}();
+    if(seqFrame>=0&&static_cast<int>(getD3D9PresentCount())==seqFrame)
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","COM seq kind=%u method=%u obj=%08x a1=%08x a2=%08x a3=%08x",kind,method,args[0],args[1],args[2],args[3]);
+    std::lock_guard<std::recursive_mutex> lock(objectsMutex);
     auto found=objects.find(args[0]);
     if(found==objects.end()||static_cast<uint32_t>(found->second.kind)!=kind){
         NFS_RUNTIME_LOG(ANDROID_LOG_ERROR,"NFSU1","Invalid D3D9 COM call object=%08x token=%08x kind=%u method=%u actualKind=%u",args[0],token,kind,method,
@@ -208,6 +353,9 @@ uint32_t dispatchGuestD3D9(uint32_t token,const uint32_t* args,uint32_t* argumen
         if(!window||deviceResetPending)return D3DERR_DEVICELOST;
         auto source=static_cast<const RECT*>(pointer(args[1])),destination=static_cast<const RECT*>(pointer(args[2]));
         auto dirty=static_cast<const RGNDATA*>(pointer(args[4]));
+#if !defined(NFS_GLES)
+        s_presentCount.fetch_add(1, std::memory_order_relaxed);
+#endif
         return kind==2?static_cast<IDirect3DDevice9*>(object)->Present(source,destination,window,dirty):
             static_cast<IDirect3DSwapChain9*>(object)->Present(source,destination,window,dirty,args[5]);
     }
@@ -264,9 +412,16 @@ uint32_t dispatchGuestD3D9(uint32_t token,const uint32_t* args,uint32_t* argumen
         case 16:{
             *argumentCount=7;auto p=static_cast<const uint32_t*>(pointer(args[5]));if(!p||!args[6])return D3DERR_INVALIDCALL;
             if(!hostWindow.load())throw std::runtime_error("D3D9 CreateDevice requires Android surface");
-            surfaceRequested=true;auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
-            while(!surfaceAvailable){if(std::chrono::steady_clock::now()>deadline)throw std::runtime_error("Android surface handover timed out");std::this_thread::sleep_for(std::chrono::milliseconds(1));}
-            auto window=dxvkAndroidGetWindowHandle();if(!window)return D3DERR_DEVICELOST;
+#if !defined(NFS_R36S)
+            if(!s_useGles){
+                surfaceRequested=true;auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+                while(!surfaceAvailable){if(std::chrono::steady_clock::now()>deadline)throw std::runtime_error("Android surface handover timed out");std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+            }
+            auto window=s_useGles ? glesAndroidGetWindowHandle() : dxvkAndroidGetWindowHandle();
+#else
+            auto window=dxvkAndroidGetWindowHandle();
+#endif
+            if(!window)return D3DERR_DEVICELOST;
             D3DPRESENT_PARAMETERS parameters{};parameters.BackBufferWidth=p[0];parameters.BackBufferHeight=p[1];parameters.BackBufferFormat=static_cast<D3DFORMAT>(p[2]);parameters.BackBufferCount=hostBackBufferCount(p[3]);
             parameters.MultiSampleType=static_cast<D3DMULTISAMPLE_TYPE>(p[4]);parameters.MultiSampleQuality=p[5];parameters.SwapEffect=static_cast<D3DSWAPEFFECT>(p[6]);parameters.hDeviceWindow=window;
             parameters.Windowed=p[8];parameters.EnableAutoDepthStencil=p[9];parameters.AutoDepthStencilFormat=static_cast<D3DFORMAT>(p[10]);parameters.Flags=p[11];parameters.FullScreen_RefreshRateInHz=p[12];parameters.PresentationInterval=D3DPRESENT_INTERVAL_IMMEDIATE;
@@ -277,8 +432,12 @@ uint32_t dispatchGuestD3D9(uint32_t token,const uint32_t* args,uint32_t* argumen
             // here with the reason instead.
             static unsigned failures=0;failures=FAILED(status)?failures+1:0;
             if(FAILED(status)&&failures<2)return status;
-            if(FAILED(status))throw std::runtime_error("La GPU no pudo crear el dispositivo grafico (Vulkan, CreateDevice "+
-                std::to_string(uint32_t(status))+"). Usa \"Probar driver\" en el launcher para ver que le falta.");
+            if(FAILED(status)){
+                if(s_useGles)throw std::runtime_error("La GPU no pudo crear el dispositivo grafico (OpenGL ES, CreateDevice "+
+                    std::to_string(uint32_t(status))+").");
+                else throw std::runtime_error("La GPU no pudo crear el dispositivo grafico (Vulkan, CreateDevice "+
+                    std::to_string(uint32_t(status))+"). Usa \"Probar driver\" en el launcher para ver que le falta.");
+            }
             write(args[6],wrap(device,Kind::Device));return status;
         }
         }
@@ -331,4 +490,36 @@ uint32_t dispatchGuestD3D9(uint32_t token,const uint32_t* args,uint32_t* argumen
         if(method==12){*argumentCount=1;copyLockBack(args[0],0);HRESULT status=kind==6?static_cast<IDirect3DVertexBuffer9*>(object)->Unlock():static_cast<IDirect3DIndexBuffer9*>(object)->Unlock();releaseLock(args[0],0);return status;}}
 #include "d3d9_resource_methods.inc"
     throw std::runtime_error("D3D9 guest method pending: kind="+std::to_string(kind)+" slot="+std::to_string(method));
+}
+
+#include "d3d9_render_thread.inc"
+
+bool dispatchGuestD3D9TryDefer(uint32_t token,const uint32_t* args,uint32_t* argumentCount,uint32_t* result){
+#if defined(NFS_R36S)
+    if(!rt::enabled)return false;
+    uint32_t kind=(token-methodBase)/4096,method=((token-methodBase)%4096)/16;
+    return rt::tryDefer(kind,method,args,argumentCount,result);
+#else
+    (void)token;(void)args;(void)argumentCount;(void)result;return false;
+#endif
+}
+
+// Diagnostics: NFSU2_COM_FAILS=1 logs COM calls whose result looks like a failing HRESULT.
+uint32_t dispatchGuestD3D9(uint32_t token,const uint32_t* args,uint32_t* argumentCount){
+    uint32_t result;
+#if defined(NFS_R36S)
+    if(rt::enabled){
+        uint32_t kind=(token-methodBase)/4096,method=((token-methodBase)%4096)/16;
+        if(rt::tryDefer(kind,method,args,argumentCount,&result))return result;
+        result=rt::syncCall(token,args,argumentCount);
+    }else
+#endif
+    result=dispatchGuestD3D9Inner(token,args,argumentCount);
+    static const bool logFails=std::getenv("NFSU2_COM_FAILS")!=nullptr;
+    if(logFails&&(result&0x80000000u)){
+        uint32_t kind=(token-methodBase)/4096,method=((token-methodBase)%4096)/16;
+        static uint32_t seen[4096];auto& n=seen[((token-methodBase)/16)&4095];
+        if(n++<5)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","COM FAIL kind=%u method=%u result=%08x a1=%08x a2=%08x a3=%08x",kind,method,result,args[1],args[2],args[3]);
+    }
+    return result;
 }

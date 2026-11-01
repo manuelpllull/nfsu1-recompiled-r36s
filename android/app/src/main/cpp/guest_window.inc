@@ -80,14 +80,18 @@ struct GuestMessage {uint32_t hwnd,message,wparam,lparam,time;int32_t x=0,y=0;};
 std::mutex messageMutex;
 std::deque<GuestMessage> windowMessages;
 uint32_t messageTime(){return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());}
+std::atomic<bool> guestShiftDown{false};
 void enqueueGuestKey(unsigned scan,bool down){
     uint32_t key=0;
-    switch(scan){case 1:key=0x1b;break;case 0xe:key=8;break;case 0x1c:key=13;break;case 0xf:key=9;break;case 0x39:key=32;break;case 0x2a:key=16;break;case 0x1d:key=17;break;case 0x38:key=18;break;
+    if(scan==0x2a||scan==0x36)guestShiftDown=down;
+    switch(scan){case 1:key=0x1b;break;case 0xe:key=8;break;case 0x1c:key=13;break;case 0xf:key=9;break;case 0x39:key=32;break;case 0x2a:key=16;break;case 0x36:key=16;break;case 0x1d:key=17;break;case 0x38:key=18;break;
+        case 0x0c:key=0xbd;break;case 0x33:key=0xbc;break;case 0x34:key=0xbe;break;case 0x28:key=0xde;break;
         case 0xc8:key=0x26;break;case 0xd0:key=0x28;break;case 0xcb:key=0x25;break;case 0xcd:key=0x27;break;
         default:{const unsigned letters[]={0x1e,0x30,0x2e,0x20,0x12,0x21,0x22,0x23,0x17,0x24,0x25,0x26,0x32,0x31,0x18,0x19,0x10,0x13,0x1f,0x14,0x16,0x2f,0x11,0x2d,0x15,0x2c};
             for(unsigned i=0;i<26;++i)if(scan==letters[i])key='A'+i;
             if(scan>=2&&scan<=0xb)key=scan==0xb?'0':'1'+scan-2;break;}}
-    if(!key)return;uint32_t flags=1|((scan&0x7f)<<16)|((scan&0x80)?1u<<24:0)|(!down?0xc0000000u:0);
+    // lParam bit 25 is reserved in WM_KEYDOWN; it carries the Shift state for TranslateMessage below.
+    if(!key)return;uint32_t flags=1|((scan&0x7f)<<16)|((scan&0x80)?1u<<24:0)|(!down?0xc0000000u:0)|(guestShiftDown.load()?1u<<25:0);
     std::lock_guard<std::mutex> lock(messageMutex);windowMessages.push_back({0,down?0x100u:0x101u,key,flags,messageTime()});
 }
 // Android text entry: the game's window procedure reads typed text from WM_CHAR
@@ -98,7 +102,13 @@ void enqueueGuestText(const std::vector<uint32_t>& characters){
 }
 // Touch as mouse: Android writes the pointer as a fraction of the game view; it is
 // turned into client coordinates of the active window under the machine lock.
+#if defined(NFS_R36S)
+// No pointer device on the handhelds: the game's cursor rests on the window's last pixel, so its arrow is drawn
+// off-screen (a centred default made the front end draw its mouse cursor in the middle of every menu).
+std::atomic<float> guestPointerX{1.0f},guestPointerY{1.0f};
+#else
 std::atomic<float> guestPointerX{0.5f},guestPointerY{0.5f};
+#endif
 constexpr uint32_t pointerPending=0xffffffffu;  // lParam placeholder of queued mouse messages
 uint32_t captureWindow{};
 std::pair<int32_t,int32_t> pointerInWindow(){
@@ -107,6 +117,9 @@ std::pair<int32_t,int32_t> pointerInWindow(){
     int32_t width=std::max(window->second.width,1),height=std::max(window->second.height,1);
     // Speed.exe's window: client pixels are its back buffer (0x71A96C), as GetClientRect reports.
     if(activeWindow==read32(0x736380)){int32_t w=int32_t(read32(0x71a96c)),h=int32_t(read32(0x71a970));if(w>0&&h>0&&w<=8192&&h<=8192){width=w;height=h;}}
+#if defined(NFS_R36S)
+    return {width+64,height+64};   // no pointer: just outside the window, so no part of the arrow is drawn
+#endif
     return {std::min(int32_t(guestPointerX.load()*float(width)),width-1),std::min(int32_t(guestPointerY.load()*float(height)),height-1)};
 }
 void enqueueGuestPointer(int phase){  // 0 down, 1 move, 2 up
@@ -144,10 +157,14 @@ void dispatchMessage(){uint32_t message=arg(0);if(!message){ret(0,1);return;}ret
 void translateMessage(){
     uint32_t address=arg(0);if(!address){ret(0,1);return;}uint32_t type=read32(address+4),key=read32(address+8);
     if(type!=0x100&&type!=0x104){ret(0,1);return;}
-    if((key>='A'&&key<='Z')||(key>='0'&&key<='9')||key==13||key==9||key==32||key==8){
-        if(key>='A'&&key<='Z')key+='a'-'A';
-        std::lock_guard<std::mutex> lock(messageMutex);windowMessages.push_back({read32(address),0x102,key,read32(address+12),messageTime()});
-    }
+    const bool shift=(read32(address+12)>>25)&1u;uint32_t ch=0;
+    if(key>='A'&&key<='Z')ch=shift?key:key+('a'-'A');
+    else if((key>='0'&&key<='9')||key==13||key==9||key==32||key==8)ch=key;
+    else if(key==0xbd)ch=shift?'_':'-';
+    else if(key==0xbe)ch='.';
+    else if(key==0xbc)ch=',';
+    else if(key==0xde)ch=shift?'"':'\'';
+    if(ch){std::lock_guard<std::mutex> lock(messageMutex);windowMessages.push_back({read32(address),0x102,ch,read32(address+12),messageTime()});}
     ret(1,1);
 }
 void postMessage(){uint32_t hwnd=arg(0);if(hwnd&&!windows.count(hwnd)){lastError=1400;ret(0,4);return;}

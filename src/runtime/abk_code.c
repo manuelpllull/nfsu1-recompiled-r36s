@@ -58,6 +58,16 @@ static int same(uint32_t base, unsigned b, uint32_t from, uint32_t to) {
 #define CACHE 64
 static struct { uint32_t va; uint32_t r; } g_cache[CACHE];
 
+/* The cache-hit part of nfs_abk_lookup: the routine's bytes are compared, the page map is not read, so
+ * guest threads that run without the machine (R36S NFS_PARALLEL_GUEST) can use it; NULL on a miss. */
+recomp_func_t nfs_abk_lookup_cached(uint32_t va) {
+    unsigned h = (va >> 2) % CACHE;
+    uint32_t cva = g_cache[h].va, cr = g_cache[h].r;
+    if (cva != va || cr >= g_nroutines) return NULL;
+    const routine_t *r = &g_routines[cr];
+    uint32_t end = r->offset + 32 < nfs_abk_blocks[r->block].len ? r->offset + 32 : nfs_abk_blocks[r->block].len;
+    return same(va - r->offset, r->block, r->offset, end) ? r->fn : NULL;
+}
 recomp_func_t nfs_abk_lookup(uint32_t va) {
     static volatile long state;
     if (!ready(&state)) {

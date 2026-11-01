@@ -62,24 +62,28 @@ void copyLockBack(uint32_t address,uint32_t subresource){
 void releaseLock(uint32_t address,uint32_t subresource){auto lock=resourceLocks.find(lockKey(address,subresource));if(lock!=resourceLocks.end()){freeGuest(lock->second.guest);resourceLocks.erase(lock);}}
 HRESULT lockTexture(uint32_t address,uint32_t level,uint32_t output,const RECT* rect,uint32_t flags){
     if(!output||resourceLocks.count(lockKey(address,level)))return D3DERR_INVALIDCALL;
-    auto texture=nativeObject<IDirect3DTexture9>(address);D3DSURFACE_DESC desc{};HRESULT status=texture->GetLevelDesc(level,&desc);if(FAILED(status))return status;
+    auto texture=nativeObject<IDirect3DTexture9>(address);if(!texture)return D3DERR_INVALIDCALL;
+    D3DSURFACE_DESC desc{};HRESULT status=texture->GetLevelDesc(level,&desc);if(FAILED(status))return status;
     D3DLOCKED_RECT lock{};status=texture->LockRect(level,&lock,rect,flags);if(FAILED(status))return status;
     return lockPixels(address,level,desc,lock,rect,flags,output);
 }
 HRESULT lockCube(uint32_t address,uint32_t face,uint32_t level,uint32_t output,const RECT* rect,uint32_t flags){
     uint32_t subresource=face*32+level;if(!output||resourceLocks.count(lockKey(address,subresource)))return D3DERR_INVALIDCALL;
-    auto texture=nativeObject<IDirect3DCubeTexture9>(address);D3DSURFACE_DESC desc{};HRESULT status=texture->GetLevelDesc(level,&desc);if(FAILED(status))return status;
+    auto texture=nativeObject<IDirect3DCubeTexture9>(address);if(!texture)return D3DERR_INVALIDCALL;
+    D3DSURFACE_DESC desc{};HRESULT status=texture->GetLevelDesc(level,&desc);if(FAILED(status))return status;
     D3DLOCKED_RECT lock{};status=texture->LockRect(static_cast<D3DCUBEMAP_FACES>(face),level,&lock,rect,flags);if(FAILED(status))return status;
     return lockPixels(address,subresource,desc,lock,rect,flags,output);
 }
 HRESULT lockSurface(uint32_t address,uint32_t output,const RECT* rect,uint32_t flags){
     if(!output||resourceLocks.count(lockKey(address,0)))return D3DERR_INVALIDCALL;
-    auto surface=nativeObject<IDirect3DSurface9>(address);D3DSURFACE_DESC desc{};HRESULT status=surface->GetDesc(&desc);if(FAILED(status))return status;
+    auto surface=nativeObject<IDirect3DSurface9>(address);if(!surface)return D3DERR_INVALIDCALL;
+    D3DSURFACE_DESC desc{};HRESULT status=surface->GetDesc(&desc);if(FAILED(status))return status;
     D3DLOCKED_RECT lock{};status=surface->LockRect(&lock,rect,flags);if(FAILED(status))return status;return lockPixels(address,0,desc,lock,rect,flags,output);
 }
 template<class Buffer,class Desc>HRESULT lockBuffer(uint32_t address,uint32_t offset,uint32_t size,uint32_t output,uint32_t flags){
     if(!output||resourceLocks.count(lockKey(address,0)))return D3DERR_INVALIDCALL;
-    auto buffer=nativeObject<Buffer>(address);Desc desc{};HRESULT status=buffer->GetDesc(&desc);if(FAILED(status))return status;
+    auto buffer=nativeObject<Buffer>(address);if(!buffer)return D3DERR_INVALIDCALL;
+    Desc desc{};HRESULT status=buffer->GetDesc(&desc);if(FAILED(status))return status;
     void* native=nullptr;status=buffer->Lock(offset,size,&native,flags);if(FAILED(status))return status;
     if(!size)size=desc.Size-offset;uint32_t temporary=allocateGuest(size);
     if(!(flags&D3DLOCK_DISCARD))std::memcpy(pointer(temporary),native,size);

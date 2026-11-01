@@ -280,32 +280,59 @@ std::string keyboardKeyName(uint32_t dik){
     }
     char text[16];std::snprintf(text,sizeof text,"Tecla %02X",dik);return text;
 }
-// IDirectInputDevice8::GetObjectInfo(DIDEVICEOBJECTINSTANCEA*, dwObj, dwHow) for the
-// keyboard (objects are DIK codes, c_dfDIKeyboard offsets) and the mouse (DIMOUSESTATE2).
-void keyboardMouseObjectInfo(uint32_t kind){
-    uint32_t output=arg(1),objectId=arg(2),how=arg(3);
-    if(!output||(read32(output)!=316&&read32(output)!=280)){ret(diInvalid,4);return;}
-    if(how!=1&&how!=2){ret(diInvalid,4);return;}  // DIPH_BYOFFSET / DIPH_BYID
-    uint32_t offset=how==1?objectId:(objectId>>8)&0xffff;
+// One keyboard/mouse object as DIDEVICEOBJECTINSTANCEA (dwSize already set: 316 or 280) by its data-format
+// offset: the keyboard's objects are DIK codes (c_dfDIKeyboard offsets), the mouse's are DIMOUSESTATE2 (X, Y,
+// wheel at 0/4/8, buttons 0..7 at 12..19). False when there is no such object.
+bool keyboardMouseObjectFill(uint32_t kind,uint32_t output,uint32_t offset){
     std::string name;uint32_t type,guidData1;uint16_t guidData2=0xc9f3;
     if(kind==2){
-        if(offset>255){ret(0x80070002,4);return;}  // DIERR_NOTFOUND
-        if(how==2&&!(objectId&0x0c)){ret(0x80070002,4);return;}
+        if(offset>255)return false;
         name=keyboardKeyName(offset);type=0x0cu|(offset<<8);guidData1=0x55728220u;guidData2=0xd33c;  // GUID_Key
     }else{
         static const char* const axes[]={"Eje X","Eje Y","Rueda"};
-        if(how==1&&offset<12&&offset%4==0){name=axes[offset/4];type=(offset==8?0x02u:0x01u)|((offset/4)<<8);guidData1=0xa36d02e0u+offset/4;}
-        else if(how==1&&offset>=12&&offset<20){name="Boton "+std::to_string(offset-12);type=0x04u|((offset-12)<<8);guidData1=0xa36d02f0u;}
-        else if(how==2&&(objectId&3)&&offset<3){name=axes[offset];type=objectId&0xffff03u;guidData1=0xa36d02e0u+offset;offset*=4;}
-        else if(how==2&&(objectId&0x0c)&&offset<8){name="Boton "+std::to_string(offset);type=objectId&0xffff0cu;guidData1=0xa36d02f0u;offset+=12;}
-        else{ret(0x80070002,4);return;}
+        if(offset<12&&offset%4==0){name=axes[offset/4];type=(offset==8?0x02u:0x01u)|((offset/4)<<8);guidData1=0xa36d02e0u+offset/4;}
+        else if(offset>=12&&offset<20){name="Boton "+std::to_string(offset-12);type=0x04u|((offset-12)<<8);guidData1=0xa36d02f0u;}
+        else return false;
     }
     uint32_t bytes=read32(output);std::memset(ptr(output+4,bytes-4),0,bytes-4);
     const uint8_t tail[8]={0xbf,0xc7,0x44,0x45,0x53,0x54,0,0};uint16_t guidData3=0x11cf;
     std::memcpy(ptr(output+4,4),&guidData1,4);std::memcpy(ptr(output+8,2),&guidData2,2);std::memcpy(ptr(output+10,2),&guidData3,2);std::memcpy(ptr(output+12,8),tail,8);
     write32(output+20,offset);write32(output+24,type);write32(output+28,0);
     std::memcpy(ptr(output+32,name.size()+1),name.c_str(),name.size()+1);
+    return true;
+}
+// IDirectInputDevice8::GetObjectInfo(DIDEVICEOBJECTINSTANCEA*, dwObj, dwHow) for the keyboard and the mouse.
+void keyboardMouseObjectInfo(uint32_t kind){
+    uint32_t output=arg(1),objectId=arg(2),how=arg(3);
+    if(!output||(read32(output)!=316&&read32(output)!=280)){ret(diInvalid,4);return;}
+    if(how!=1&&how!=2){ret(diInvalid,4);return;}  // DIPH_BYOFFSET / DIPH_BYID
+    uint32_t offset=how==1?objectId:(objectId>>8)&0xffff;
+    if(how==2){   // by ID: instance number and object type -> data-format offset
+        if(kind==2){if(!(objectId&0x0c)){ret(0x80070002,4);return;}}
+        else if((objectId&3)&&offset<3)offset*=4;
+        else if((objectId&0x0c)&&offset<8)offset+=12;
+        else{ret(0x80070002,4);return;}
+    }else if(kind==3&&!(offset<12&&offset%4==0)&&!(offset>=12&&offset<20)){ret(0x80070002,4);return;}
+    if(!keyboardMouseObjectFill(kind,output,offset)){ret(0x80070002,4);return;}  // DIERR_NOTFOUND
     ret(0,4);
+}
+// IDirectInputDevice8::EnumObjects(callback, context, flags) for the keyboard and the mouse: the controls
+// screen enumerates them when the player remaps an action (it stopped the game before: method 4 pending).
+// The keyboard lists the keys that have a name; DIDFT_* filter flags select axes/buttons; the callback
+// returns DIENUM_STOP (0) to end early.
+void keyboardMouseEnumObjects(uint32_t kind){
+    uint32_t callback=arg(1),context=arg(2),flags=arg(3);if(!callback){ret(diInvalid,4);return;}
+    std::vector<uint32_t> offsets;
+    if(kind==2){for(uint32_t dik=1;dik<256;++dik)if(keyboardKeyName(dik).rfind("Tecla ",0)!=0)offsets.push_back(dik);}
+    else{for(uint32_t o=0;o<12;o+=4)offsets.push_back(o);for(uint32_t o=12;o<20;++o)offsets.push_back(o);}
+    uint32_t instance=allocate(316);
+    try{for(uint32_t offset:offsets){
+        write32(instance,316);if(!keyboardMouseObjectFill(kind,instance,offset))continue;
+        uint32_t category=flags&0x1f;
+        if(category&&!(read32(instance+24)&category))continue;
+        if(!callGuest(callback,{instance,context}))break;
+    }}catch(...){heaps->free(GuestHeaps::process,instance);throw;}
+    heaps->free(GuestHeaps::process,instance);ret(0,4);
 }
 void inputDispatch(){
     uint32_t kind=(inputToken-inputMethodBase)/0x1000,method=((inputToken-inputMethodBase)%0x1000)/16;
@@ -368,6 +395,7 @@ void inputDispatch(){
     }
     if(kind==4&&joystickMethod(object,self,method))return;
     if(method==14){keyboardMouseObjectInfo(kind);return;}
+    if(method==4){keyboardMouseEnumObjects(kind);return;}
     switch(method){
     case 3:{uint32_t output=arg(1);if(!output||read32(output)!=44){ret(diInvalid,2);return;}
         std::memset(ptr(output+4,40),0,40);write32(output+4,1);write32(output+8,kind==2?0x413:0x212);
@@ -461,7 +489,7 @@ void inputDispatch(){
         if(read32(format+40)>4096){ret(diInvalid,4);return;}
         object.format=std::move(items);object.size=read32(format+8);object.bufferSize=read32(format+40);object.pending.clear();object.overflow=false;
         inputDrivingMode=std::any_of(object.format.begin(),object.format.end(),[](const InputFormatObject& item){return item.user==1&&((item.type>>8)&0xffff)==0xc8;});
-        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU1","Keyboard SetActionMap installed %zu actions, %u bytes, buffer=%u",object.format.size(),object.size,object.bufferSize);ret(0,4);return;}
+        NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU1","Keyboard SetActionMap installed %zu actions, %u bytes, buffer=%u (driving controls %s)",object.format.size(),object.size,object.bufferSize,inputDrivingMode.load()?"on":"off");ret(0,4);return;}
     default:throw GuestStop("DirectInput device method pending: "+std::to_string(method));
     }
 }

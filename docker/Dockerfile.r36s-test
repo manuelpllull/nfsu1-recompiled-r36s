@@ -1,0 +1,33 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
+
+# Install toolchains, SDL2, OpenGL ES, and testing utilities
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    ninja-build \
+    git \
+    python3 \
+    python3-pip \
+    libsdl2-dev \
+    libgles2-mesa-dev \
+    libegl1-mesa-dev \
+    libgl1-mesa-dri \
+    mesa-utils \
+    xvfb \
+    x11-utils \
+    libx11-dev \
+    libxrandr-dev \
+    libxinerama-dev \
+    libxcursor-dev \
+    libxi-dev \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install python dependencies for lifter and binary analysis
+RUN pip3 install --no-cache-dir pefile capstone Pillow
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

@@ -1,0 +1,34 @@
+# GPTOKEYB profile for Need for Speed: Underground (R36S / RK3326)
+back = r
+start = esc
+
+b = up
+a = space
+y = down
+x = c
+
+l1 = b
+l2 = down
+r1 = lshift
+r2 = up
+
+up = up
+down = down
+left = left
+right = right
+
+left_analog_up = up
+left_analog_down = down
+left_analog_left = left
+left_analog_right = right
+
+right_analog_up = mouse_up
+right_analog_down = mouse_down
+right_analog_left = mouse_left
+right_analog_right = mouse_right
+
+deadzone_mode = axial
+deadzone = 3000
+
+hotkey = select
+hotkey_start = esc

@@ -12,7 +12,10 @@ struct SoundObject {
 };
 std::map<uint32_t,SoundObject> soundObjects;
 std::map<uint32_t,uint32_t> soundMethodCalls;
-uint32_t soundToken{};
+thread_local uint32_t soundToken{};
+// Guards soundObjects/soundMethodCalls and every DirectSound object: buffer methods also run on the free
+// sound thread without the guest machine (R36S). soundDispatch never takes the machine while holding it.
+std::recursive_mutex soundStateMutex;
 #ifdef __ANDROID__
 AAudioStream* soundStream=nullptr;
 int32_t soundLastXruns=0;
@@ -92,6 +95,31 @@ void serviceGuestSound(){
         xruns,AAudioStream_getBufferSizeInFrames(soundStream),capacity,burst,soundMixer.rate,
         soundCallbackPeakUs.exchange(0,std::memory_order_relaxed),int(AAudioStream_getPerformanceMode(soundStream)));
 }
+#elif defined(NFS_SDL_AUDIO)
+static SDL_AudioDeviceID s_sdlAudioDevice = 0;
+static void sdlAudioCallback(void*, Uint8* stream, int len) {
+    unsigned frames = unsigned(len / (sizeof(float) * 2));
+    soundMixer.render(reinterpret_cast<float*>(stream), frames);
+}
+void serviceGuestSound() {}
+bool startSoundStream() {
+    if (s_sdlAudioDevice) return true;
+    if (SDL_WasInit(SDL_INIT_AUDIO) == 0) {
+        if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) return false;
+    }
+    SDL_AudioSpec desired{}, obtained{};
+    desired.freq = 44100;
+    desired.format = AUDIO_F32SYS;
+    desired.channels = 2;
+    desired.samples = 1024;
+    desired.callback = sdlAudioCallback;
+    s_sdlAudioDevice = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+    if (!s_sdlAudioDevice) return false;
+    soundMixer.rate = unsigned(obtained.freq);
+    SDL_PauseAudioDevice(s_sdlAudioDevice, 0);
+    NFS_RUNTIME_LOG(ANDROID_LOG_INFO, "NFSU2", "SDL2 stereo float audio started: %u Hz", soundMixer.rate);
+    return true;
+}
 #else
 void serviceGuestSound(){}
 bool startSoundStream(){return true;} // Host tests inspect the mixer; no physical audio output.
@@ -99,13 +127,15 @@ bool startSoundStream(){return true;} // Host tests inspect the mixer; no physic
 void shutdownGuestSound(){
 #ifdef __ANDROID__
     if(soundStream){AAudioStream_requestStop(soundStream);AAudioStream_close(soundStream);soundStream=nullptr;}
+#elif defined(NFS_SDL_AUDIO)
+    if(s_sdlAudioDevice){SDL_CloseAudioDevice(s_sdlAudioDevice);s_sdlAudioDevice=0;}
 #endif
     for(auto& item:soundObjects){auto& object=item.second;if(object.voice)soundMixer.remove(object.voice);
         if(object.guestSamples)heaps->free(GuestHeaps::process,object.guestSamples);
         heaps->free(GuestHeaps::process,object.table);heaps->free(GuestHeaps::process,item.first);}
     soundObjects.clear();
 }
-uint32_t createSoundObject(uint32_t kind,uint32_t flags=0){
+uint32_t createSoundObject(uint32_t kind,uint32_t flags=0){std::lock_guard<std::recursive_mutex> l(soundStateMutex);
     uint32_t address=allocate(4),table=allocate(24*4);
     for(uint32_t slot=0;slot<24;++slot)write32(table+4*slot,soundMethodBase+kind*0x1000+slot*16);
     write32(address,table);soundObjects.emplace(address,SoundObject{kind,table,1,flags});return address;
@@ -124,7 +154,9 @@ void directSoundCreate(){
     if(!startSoundStream()){ret(0x88780078,3);return;}
     write32(arg(1),createSoundObject(1));ret(0,3);
 }
-void soundDispatch(){
+void soundDispatchBody();
+void soundDispatch(){std::lock_guard<std::recursive_mutex> l(soundStateMutex);soundDispatchBody();}
+void soundDispatchBody(){
     uint32_t kind=(soundToken-soundMethodBase)/0x1000,method=((soundToken-soundMethodBase)%0x1000)/16,self=arg(0);
     auto found=soundObjects.find(self);if(found==soundObjects.end()||found->second.kind!=kind)throw GuestStop("Invalid DirectSound object");
     auto& object=found->second;

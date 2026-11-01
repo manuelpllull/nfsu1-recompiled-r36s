@@ -1,0 +1,27 @@
+{
+  "version": 8,
+  "name": "nfsu.zip",
+  "items": [
+    "NFSU.sh",
+    "nfsu/"
+  ],
+  "items_opt": [],
+  "attr": {
+    "title": "Need for Speed: Underground",
+    "desc": "Native static binary recompilation of Need for Speed: Underground (SPEED.EXE) for Rockchip RK3326 and ARM64 Linux handhelds.",
+    "inst": "Copy your retail PC Need for Speed Underground installation files into the ports/nfsu/gamedata/ folder on your SD card. Required: SPEED.EXE, GLOBAL, CARS, TRACKS, SOUND, MOVIES.",
+    "genres": [
+      "Racing",
+      "Action"
+    ],
+    "portver": "1.0.0",
+    "runtimes": [],
+    "reqs": [
+      "640x480",
+      "1GB RAM"
+    ],
+    "arch": [
+      "aarch64"
+    ]
+  }
+}

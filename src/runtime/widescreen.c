@@ -36,10 +36,13 @@
 #endif
 
 static float s_display_aspect;          /* 0: off, the game keeps 4:3 */
+static unsigned s_force_w, s_force_h;   /* R36S: the render size the host chose for the panel (0: the game's) */
 static float s_aspect = 4.0f / 3.0f;    /* the render target's, once widened */
 /* FOV constants of the three reads after 0x40DDD2, chosen per view id. */
 static double s_fov_scale[3] = {1.0, 0.5, 1.0};
 static int s_fe_cursor;                 /* touch host: cursor in FE units */
+static int s_hide_cursor;               /* no pointing device (R36S): the arrow is drawn off screen */
+void nfs_widescreen_hide_cursor(int on) { s_hide_cursor = on; }
 void nfs_frontend_cursor_units(int on) { s_fe_cursor = on; }
 /* FixHUD: fHudPosX (centre of the 4:3 HUD in wide HUD units) and the mod's
  * fWidescreenHudOffset (= fHudPosX - 320 with HudAspectRatioConstraint Auto). */
@@ -118,6 +121,10 @@ void nfs_widescreen_init(const char *game_root) { (void)game_root; }
 void nfs_widescreen_set_display_aspect(float aspect) {
     s_display_aspect = aspect > 1.34f ? aspect : 0.0f;
 }
+void nfs_widescreen_set_render_size(unsigned width, unsigned height) {
+    s_force_w = width >= 320 && height >= 240 ? width & ~1u : 0;
+    s_force_h = s_force_w ? height & ~1u : 0;
+}
 void nfs_widescreen_set_resolution(unsigned width, unsigned height) {
     if (width && height) s_aspect = (float)width / (float)height;
 }
@@ -130,7 +137,16 @@ void recomp_hook(uint32_t va) {
     /* Arrow draw calls: X/Y loaded, about to be pushed for sub_004F3030. */
     /* Arrow draw calls: superseded (the touch cursor is already in FE units);
      * the lifted code still calls here, so they stay accepted and inert. */
-    if (va == 0x00409EB8u || va == 0x00401832u) return;
+    if (va == 0x00409EB8u || va == 0x00401832u) {
+        /* sub_004F3030(x, y) draws the front-end mouse arrow (always in the front end, elsewhere until
+         * the mouse rests). A host without a pointing device moves it off screen: x/y are in ecx/eax
+         * at 0x409EB8 and in eax/edx at 0x401832. */
+        if (s_hide_cursor) {
+            if (va == 0x00409EB8u) { g_ecx = (uint32_t)-4096; g_eax = (uint32_t)-4096; }
+            else { g_eax = (uint32_t)-4096; g_edx = (uint32_t)-4096; }
+        }
+        return;
+    }
     /* Mouse clamp (0x4131A0) after GetClientRect: the FE-unit cursor of a
      * touch host spans [0, 2 * fHudPosX] (the mod's ClientRectHook1/2). */
     if (va == 0x004131B5u) {
@@ -141,19 +157,19 @@ void recomp_hook(uint32_t va) {
         MEM32(g_esp + 0xC) = 480;
         return;
     }
-    if (s_display_aspect <= 0.0f) return;
-    for (unsigned i = 0; i < sizeof k_hit / sizeof k_hit[0]; i++) {
-        if (k_hit[i].va != va) continue;
-        uint32_t *r = k_hit[i].reg == 0 ? &g_eax : k_hit[i].reg == 1 ? &g_ecx : &g_edx;
-        *r += (uint32_t)(int32_t)lroundf(320.0f - s_hud_pos_x);
-        return;
-    }
-    switch (va) {
-    /* End of the resolution setter (0x4086B0, width pushed, height in esi):
-     * it filled D3DPRESENT_PARAMETERS (0x71A96C) and the screen size globals
-     * (0x701034/0x701038). Keep the chosen height, widen to the display. */
-    case 0x0040875Au: {
+    /* End of the resolution setter (0x4086B0, width pushed, height in esi): it filled
+     * D3DPRESENT_PARAMETERS (0x71A96C) and the screen size globals (0x701034/0x701038).
+     * R36S: the size the host chose for the panel replaces the menu's choice (the game would
+     * otherwise render 800x600 and the scaler shrink it to a 640x480 panel). Wide displays:
+     * keep the chosen height, widen to the display. */
+    if (va == 0x0040875Au) {
+        if (s_force_w && s_force_h) {
+            MEM32(0x0071A96Cu) = s_force_w; MEM32(0x00701034u) = s_force_w;
+            MEM32(0x0071A970u) = s_force_h; MEM32(0x00701038u) = s_force_h;
+        }
         uint32_t height = MEM32(0x0071A970u);
+        if (height) s_aspect = (float)MEM32(0x0071A96Cu) / (float)height;
+        if (s_display_aspect <= 0.0f) return;
         uint32_t width = (uint32_t)lroundf((float)height * s_display_aspect) & ~1u;
         if (height && width > MEM32(0x0071A96Cu)) {
             MEM32(0x0071A96Cu) = width;
@@ -168,8 +184,16 @@ void recomp_hook(uint32_t va) {
             wrf(0x006CC914u, scale);
             wrf(0x006CC910u, s_hud_pos_x);   /* fcomp at 0x41E58F; the minimap is put back below */
         }
-        break;
+        return;
     }
+    if (s_display_aspect <= 0.0f) return;
+    for (unsigned i = 0; i < sizeof k_hit / sizeof k_hit[0]; i++) {
+        if (k_hit[i].va != va) continue;
+        uint32_t *r = k_hit[i].reg == 0 ? &g_eax : k_hit[i].reg == 1 ? &g_ecx : &g_edx;
+        *r += (uint32_t)(int32_t)lroundf(320.0f - s_hud_pos_x);
+        return;
+    }
+    switch (va) {
     /* HUD anchors: `mov [esp+N], 320.0` -> fHudPosX. */
     case 0x004F20A7u: wrf(g_esp + 0x80, s_hud_pos_x); break;
     case 0x004F2333u: wrf(g_esp + 0x90, s_hud_pos_x); break;

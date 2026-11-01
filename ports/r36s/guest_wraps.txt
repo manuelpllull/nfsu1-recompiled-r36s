@@ -1,0 +1,3 @@
+recomp_0064.c sub_004F0390
+recomp_0003.c sub_0040ED50
+recomp_0195.c sub_00674898

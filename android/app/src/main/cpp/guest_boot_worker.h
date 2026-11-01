@@ -4,22 +4,30 @@
 #include <mutex>
 #include <string>
 #include <stdexcept>
+#include <atomic>
 
 class GuestBootWorker {
     pthread_t thread_{};
     bool started_=false;
+    std::atomic<bool> finished_{false};
     std::mutex mutex_;
     std::string executable_,status_="Arranque CRT pendiente";
     static void* run(void* context) {
         auto& self=*static_cast<GuestBootWorker*>(context);
         auto result=connectGuestRuntime(self.executable_.c_str());
-        std::lock_guard<std::mutex> guard(self.mutex_);self.status_=result;return nullptr;
+        {
+            std::lock_guard<std::mutex> guard(self.mutex_);
+            self.status_=result;
+        }
+        self.finished_.store(true, std::memory_order_release);
+        return nullptr;
     }
 public:
     ~GuestBootWorker(){if(started_){requestGuestRuntimeStop();pthread_join(thread_,nullptr);}}
     void start(const std::string& executable) {
         if(started_)return;
         executable_=executable;
+        finished_.store(false, std::memory_order_release);
         {std::lock_guard<std::mutex> guard(mutex_);status_="Ejecutando entrada CRT del juego…";}
         pthread_attr_t attributes;
         if(pthread_attr_init(&attributes))throw std::runtime_error("Guest thread attributes failed");
@@ -29,5 +37,6 @@ public:
         if(result)throw std::runtime_error("Guest worker creation failed: "+std::to_string(result));
         started_=true;
     }
+    bool isFinished() const { return finished_.load(std::memory_order_acquire); }
     std::string status(){std::lock_guard<std::mutex> guard(mutex_);return status_;}
 };
