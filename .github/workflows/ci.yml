@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # The repository must never contain the game or code generated from it (src/recomp/gen*, Speed.exe,
+  # compiled binaries). Fails the build if any such file is tracked.
+  no-game-files:
+    name: No game files tracked
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Check tracked files
+        run: bash scripts/check_no_game_files.sh
+
+  # Compiles the whole R36S runtime and the D3D9 -> OpenGL ES bridge for ARM64 with the vendored headers
+  # (ports/r36s/sdk). The lifted game code is not part of the repository, so this does not link a binary.
+  build-check:
+    name: Compile the R36S runtime (ARM64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install the ARM64 cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu
+      - name: Compile
+        run: COMPILE_ONLY=1 BUILD_ID="ci-${GITHUB_SHA::7}" bash ports/r36s/build_ci.sh
+
+  unit-tests:
+    name: Unit tests (audio mixer, frame pacer)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build and run
+        run: |
+          set -e
+          for t in audio_mixer frame_pacer; do
+            g++ -std=c++17 -O1 -o "/tmp/$t" "tests/$t.cpp" -lpthread
+            "/tmp/$t"
+          done

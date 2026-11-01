@@ -1,0 +1,128 @@
+name: Release R36S bundle
+
+# Manual only (Actions > Release R36S bundle > Run workflow). Builds the PortMaster bundle for the R36S
+# (launcher, settings, metadata, docs) and publishes it as a GitHub release, a draft by default.
+#
+# The game binary (nfsu.aarch64) contains the lifted game code, which is generated from Speed.exe and is
+# not in this repository. It is added to the bundle only when include_binary is ticked AND the repository
+# secret GUEST_OBJS_URL points at a tar.gz of the precompiled guest objects (*.o). Create that archive on
+# the machine where you built the game, and host it somewhere private (a secret URL), not in a public
+# release:
+#     tar czf guest-objs.tar.gz -C build/r36s-vm/guest .
+# Publishing a bundle with the binary distributes code derived from the game: that is your decision; leave
+# include_binary off to publish the launcher-only bundle.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. r36s-v12)'
+        required: true
+        type: string
+      release_title:
+        description: 'Release title (empty = "NFSU1 R36S <tag>")'
+        required: false
+        default: ''
+        type: string
+      build_id:
+        description: 'Build id shown in the game banner (empty = the tag)'
+        required: false
+        default: ''
+        type: string
+      include_binary:
+        description: 'Build nfsu.aarch64 from the guest objects in the GUEST_OBJS_URL secret and include it'
+        required: false
+        default: false
+        type: boolean
+      draft:
+        description: 'Create the release as a draft'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      TAG_NAME: ${{ inputs.tag_name }}
+      RELEASE_TITLE: ${{ inputs.release_title }}
+      BUILD_ID_INPUT: ${{ inputs.build_id }}
+      INCLUDE_BINARY: ${{ inputs.include_binary }}
+      GUEST_OBJS_URL: ${{ secrets.GUEST_OBJS_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check tracked files
+        run: bash scripts/check_no_game_files.sh
+
+      - name: Install the ARM64 cross toolchain and zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu zip
+
+      - name: Build nfsu.aarch64 from the guest objects
+        if: ${{ inputs.include_binary }}
+        run: |
+          set -e
+          if [ -z "$GUEST_OBJS_URL" ]; then
+            echo "::error::include_binary needs the repository secret GUEST_OBJS_URL (a direct link to a tar.gz of the guest *.o files)"
+            exit 1
+          fi
+          mkdir -p build/guest-objs build/out
+          curl -fsSL "$GUEST_OBJS_URL" -o build/guest-objs.tar.gz
+          tar -xzf build/guest-objs.tar.gz -C build/guest-objs
+          COUNT="$(find build/guest-objs -name '*.o' | wc -l | tr -d ' ')"
+          [ "$COUNT" -gt 0 ] || { echo "::error::no *.o files in the guest objects archive"; exit 1; }
+          echo "Found $COUNT guest objects."
+          GUEST_DIR="$GITHUB_WORKSPACE/build/guest-objs" \
+          OUT="$GITHUB_WORKSPACE/build/out" \
+          BUILD_ID="${BUILD_ID_INPUT:-$TAG_NAME}" \
+          bash ports/r36s/build_ci.sh
+
+      - name: Package the PortMaster bundle
+        run: |
+          set -e
+          if [ "$INCLUDE_BINARY" = "true" ]; then export BINARY="$GITHUB_WORKSPACE/build/out/nfsu.aarch64"; fi
+          bash ports/r36s/package_release.sh
+
+      - name: Write the release notes
+        run: |
+          {
+            echo "## Need for Speed: Underground, R36S / PortMaster"
+            echo
+            echo "- Target: Rockchip RK3326 handhelds (R36S, RG351MP, ...) with ArkOS, AmberELEC or ROCKNIX, 640x480, ARM64"
+            echo "- Graphics: Direct3D 9 translated to OpenGL ES 2.0 (MojoShader)"
+            echo "- Commit: ${GITHUB_SHA}"
+            echo
+            echo "### Install"
+            echo "1. Extract \`NFSU-R36S.zip\` into the \`ports/\` folder of your SD card (you get \`NFSU.sh\` and \`nfsu/\`)."
+            echo "2. Copy your own retail PC game files (patch 1.4: \`Speed.exe\`, \`GLOBAL\`, \`CARS\`, \`TRACKS\`, \`SOUND\`, \`MOVIES\`, ...) into \`ports/nfsu/gamedata/\`."
+            echo "3. Start it from the Ports menu. Settings are in \`nfsu/nfsu.cfg\`; see \`nfsu/README.md\`."
+            echo
+            if [ "$INCLUDE_BINARY" != "true" ]; then
+              echo "> This bundle does **not** include the game binary \`nfsu.aarch64\`; it has to be built from your own copy of the game (see the README)."
+              echo
+            fi
+            echo "No game files are included. Credits: the [NFSU2 Recompiled](https://github.com/codepdbh/nfsu2-recompiled) project and [pcrecomp](https://github.com/sp00nznet/pcrecomp)."
+          } > build/release_notes.md
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          name: ${{ inputs.release_title != '' && inputs.release_title || format('NFSU1 R36S {0}', inputs.tag_name) }}
+          draft: ${{ inputs.draft }}
+          prerelease: false
+          body_path: build/release_notes.md
+          files: |
+            dist/NFSU-R36S.zip
+            dist/NFSU-R36S.zip.sha256
