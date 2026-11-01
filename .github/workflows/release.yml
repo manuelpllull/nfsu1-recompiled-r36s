@@ -96,6 +96,7 @@ jobs:
 
       - name: Write the release notes
         run: |
+          mkdir -p build
           {
             echo "## Need for Speed: Underground, R36S / PortMaster"
             echo

@@ -22,3 +22,6 @@ KIMI_V7_CHECK_PROMPT.md
 # Compiled game binaries (derived from the game code), their debug copies and update parts: never commit
 *.aarch64
 *.aarch64.*
+
+# Release bundles (they can contain the game binary)
+dist/
